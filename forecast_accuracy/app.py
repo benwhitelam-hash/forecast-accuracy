@@ -100,8 +100,11 @@ c4.metric("Outturn span",
           (summary["outturn_span"][0] or "—")[:10] + " → " +
           (summary["outturn_span"][1] or "—")[:10])
 
-# -- Yesterday / today / tomorrow HH chart -----------------------------------
-st.subheader("Half-hourly prices — yesterday, today, tomorrow")
+# -- Half-hourly prices chart (sliding window over last 30 days → tomorrow) --
+RECENT_DAYS_BACK = 30
+RECENT_DAYS_FORWARD = 2  # today + tomorrow (exclusive end at end of tomorrow)
+
+st.subheader("Half-hourly prices")
 st.caption(
     "All series normalised to **£/MWh**. Retail series (Octopus Agile, "
     "AgilePredict) are p/kWh × 10 with VAT and retail margin left in — they "
@@ -111,17 +114,79 @@ st.caption(
 )
 
 with storage.connect() as conn:
-    recent = analysis.recent_prices(conn, region=region)
+    recent_all = analysis.recent_prices(
+        conn, region=region,
+        days_back=RECENT_DAYS_BACK,
+        days_forward=RECENT_DAYS_FORWARD,
+    )
+
+# Work out UK-local day bounds for the slider (covers the whole pre-loaded
+# window end-to-end; today = UK midnight of today).
+from datetime import date as _date, datetime as _dt, time as _time, timedelta as _td, timezone as _tz
+from zoneinfo import ZoneInfo as _ZI
+_UK = _ZI("Europe/London")
+_today_uk_date: _date = _dt.now(_tz.utc).astimezone(_UK).date()
+_min_date = _today_uk_date - _td(days=RECENT_DAYS_BACK)
+_max_date = _today_uk_date + _td(days=RECENT_DAYS_FORWARD - 1)   # tomorrow
+_default_start = _today_uk_date - _td(days=1)                    # yesterday
+_default_end = _max_date                                         # tomorrow
+
+slider_start, slider_end = st.slider(
+    "Date range (UK local, inclusive)",
+    min_value=_min_date,
+    max_value=_max_date,
+    value=(_default_start, _default_end),
+    format="YYYY-MM-DD",
+    help=(
+        f"Drag to pan or resize the window. Data is pre-loaded for the "
+        f"last {RECENT_DAYS_BACK} days plus tomorrow; filtering is instant."
+    ),
+)
+
+
+def _uk_date_to_utc_naive(d: _date, end_of_day: bool = False) -> pd.Timestamp:
+    """UK-local midnight (or next-day midnight) → naive UTC Timestamp to
+    match the DataFrame's `target_start` dtype (which read_sql_query parses
+    from 'Z'-suffixed ISO strings as naive UTC)."""
+    if end_of_day:
+        d = d + _td(days=1)
+    dt_uk = _dt.combine(d, _time(0, 0, tzinfo=_UK))
+    return pd.Timestamp(dt_uk.astimezone(_tz.utc).replace(tzinfo=None))
+
+
+_win_start_utc = _uk_date_to_utc_naive(slider_start, end_of_day=False)
+_win_end_utc = _uk_date_to_utc_naive(slider_end, end_of_day=True)
+
+if recent_all.empty:
+    recent = recent_all
+else:
+    # Normalise target_start to naive UTC so the slider comparison is clean.
+    # read_sql_query + parse_dates usually gives us a tz-naive UTC datetime64
+    # column, but if pandas returned object dtype (e.g. from a mixed-empty
+    # concat) or tz-aware, coerce it here.
+    ts = recent_all["target_start"]
+    if not pd.api.types.is_datetime64_any_dtype(ts):
+        ts = pd.to_datetime(ts, utc=True, errors="coerce")
+    if getattr(ts.dt, "tz", None) is not None:
+        ts = ts.dt.tz_convert("UTC").dt.tz_localize(None)
+    recent_all = recent_all.assign(target_start=ts)
+    recent = recent_all[
+        (recent_all["target_start"] >= _win_start_utc) &
+        (recent_all["target_start"] <  _win_end_utc)
+    ].copy()
 
 if recent.empty:
     st.info(
-        "No half-hourly prices yet for the yesterday/today/tomorrow window. "
-        "Hit **Refresh data** with AgilePredict, Octopus Agile, Elexon APX and "
-        "Elexon within-day all ticked."
+        "No half-hourly prices for the selected window. Widen the slider or "
+        "hit **Refresh data** with AgilePredict, Octopus Agile, Elexon APX "
+        "and Elexon within-day all ticked."
     )
 else:
     now_utc_ts = pd.Timestamp.utcnow().tz_localize(None)
-    now_df = pd.DataFrame({"now": [now_utc_ts]})
+    window_span_days = (slider_end - slider_start).days + 1
+    # Dots only read as dots when there's room for them — above ~5 days the
+    # line-only rendering is much easier on the eye.
+    show_points = window_span_days <= 5
 
     # Friendly fixed colour order: day-ahead gold, within-day purple,
     # confirmed blue, predicted red.
@@ -129,9 +194,12 @@ else:
         domain=analysis.RECENT_SERIES_LABELS,
         range=["#E1A800", "#6A3D9A", "#1F77B4", "#D62728"],
     )
+    _mark_kwargs = {"strokeWidth": 1.8}
+    if show_points:
+        _mark_kwargs["point"] = alt.OverlayMarkDef(size=18, filled=True)
     base = (
         alt.Chart(recent)
-        .mark_line(point=alt.OverlayMarkDef(size=18, filled=True), strokeWidth=1.8)
+        .mark_line(**_mark_kwargs)
         .encode(
             x=alt.X("target_start:T", title="Half-hour (UTC)"),
             y=alt.Y("value_gbp_per_mwh:Q", title="£/MWh"),
@@ -145,13 +213,17 @@ else:
             ],
         )
     )
-    now_rule = (
-        alt.Chart(now_df)
-        .mark_rule(strokeDash=[4, 4], color="#888")
-        .encode(x="now:T")
-    )
-    st.altair_chart((base + now_rule).interactive(bind_y=False),
-                    width="stretch")
+    # Only draw the "now" rule when now is actually inside the selected
+    # window — otherwise Altair would stretch the X axis to include it and
+    # compress the data into a corner.
+    layers = [base]
+    if _win_start_utc <= now_utc_ts < _win_end_utc:
+        now_df = pd.DataFrame({"now": [now_utc_ts]})
+        layers.append(
+            alt.Chart(now_df).mark_rule(strokeDash=[4, 4], color="#888").encode(x="now:T")
+        )
+    chart = layers[0] if len(layers) == 1 else alt.layer(*layers)
+    st.altair_chart(chart.interactive(bind_y=False), width="stretch")
     present = set(recent["series"].unique())
     missing = [s for s in analysis.RECENT_SERIES_LABELS if s not in present]
     if missing:

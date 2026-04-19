@@ -111,21 +111,30 @@ def monthly_accuracy(df: pd.DataFrame,
     return out.sort_values(["month", "horizon_bucket"])
 
 
-def yesterday_today_tomorrow_window(now: datetime | None = None) -> tuple[str, str, datetime]:
+def day_window(days_back: int = 1,
+               days_forward: int = 2,
+               now: datetime | None = None) -> tuple[str, str, datetime]:
     """Return (utc_start_iso, utc_end_iso, uk_today_midnight) covering
-    yesterday 00:00 UK through tomorrow 23:59 UK. ISO strings end in 'Z'.
+    `days_back` days before UK today-midnight through `days_forward` days
+    ahead (exclusive end). `days_back=1, days_forward=2` reproduces the
+    yesterday → end-of-tomorrow window. ISO strings end in 'Z'.
     """
     now_utc = now or datetime.now(timezone.utc)
     now_uk = now_utc.astimezone(UK)
     today_uk = now_uk.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_uk = today_uk - timedelta(days=1)
-    end_uk = today_uk + timedelta(days=2)  # exclusive end → covers all of tomorrow
+    start_uk = today_uk - timedelta(days=int(days_back))
+    end_uk = today_uk + timedelta(days=int(days_forward))
     start_utc = start_uk.astimezone(timezone.utc).replace(microsecond=0)
     end_utc = end_uk.astimezone(timezone.utc).replace(microsecond=0)
 
     def _z(dt: datetime) -> str:
         return dt.isoformat().replace("+00:00", "Z")
     return _z(start_utc), _z(end_utc), today_uk
+
+
+def yesterday_today_tomorrow_window(now: datetime | None = None) -> tuple[str, str, datetime]:
+    """Back-compat shim: yesterday 00:00 UK → tomorrow 23:59 UK."""
+    return day_window(days_back=1, days_forward=2, now=now)
 
 
 # Display labels for the recent-prices chart, ordered for legend stability.
@@ -139,15 +148,22 @@ RECENT_SERIES_LABELS = [
 
 def recent_prices(conn: sqlite3.Connection,
                   region: str = "G",
-                  now: datetime | None = None) -> pd.DataFrame:
-    """Long-format DataFrame of HH prices across yesterday/today/tomorrow,
+                  now: datetime | None = None,
+                  days_back: int = 1,
+                  days_forward: int = 2) -> pd.DataFrame:
+    """Long-format DataFrame of HH prices over a UK-aligned day window,
     one row per (target_start, series). All values normalised to GBP/MWh
     (Octopus & AgilePredict are p/kWh × 10 — VAT and retail margin are
     *not* removed, so retail series will sit systematically above wholesale).
 
+    Defaults to yesterday / today / tomorrow. Pass a larger `days_back` /
+    `days_forward` to pre-load a wider window (e.g. for a client-side slider).
+
     Columns: target_start (UTC datetime), series (str), value_gbp_per_mwh (float).
     """
-    start_iso, end_iso, _today = yesterday_today_tomorrow_window(now)
+    start_iso, end_iso, _today = day_window(days_back=days_back,
+                                            days_forward=days_forward,
+                                            now=now)
 
     # Forecasts: keep the freshest snapshot per target_start (whatever horizon).
     fc_sql = """
