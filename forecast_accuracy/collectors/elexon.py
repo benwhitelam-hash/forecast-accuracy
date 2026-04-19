@@ -80,17 +80,26 @@ def collect(conn, days_back: int = 30, provider: str = DEFAULT_PROVIDER) -> int:
     started = utcnow_iso()
     try:
         today = datetime.now(timezone.utc).date()
+        # Elexon MID's `to` parameter behaves like an exclusive / publish-time
+        # filter: a query with `to=today` only returns a handful of today's
+        # rows (the ones already in the cache at that moment), not the full
+        # 48 half-hours that the day-ahead auction cleared last night. Push
+        # the horizon two days past today so the last chunk covers
+        # [today-n, today+2] — today then comes back complete, and any
+        # future rows (tomorrow's day-ahead after its own auction, or early
+        # within-day) are a bonus, not an error.
+        horizon = today + timedelta(days=2)
         rows_added_total = 0
         # Elexon caps per-call range — chunk in 7-day windows to be safe.
         cursor = today - timedelta(days=days_back)
-        while cursor <= today:
-            chunk_end = min(cursor + timedelta(days=7), today)
+        while cursor <= horizon:
+            chunk_end = min(cursor + timedelta(days=7), horizon)
             results = fetch(cursor.isoformat(), chunk_end.isoformat(), provider)
             rows = list(_rows_from_payload(results))
             rows_added_total += insert_outturn(conn, rows) if rows else 0
             cursor = chunk_end + timedelta(days=1)
         record_run(conn, f"elexon:{provider}", started, utcnow_iso(), rows_added_total, "ok",
-                   f"{days_back}d back")
+                   f"{days_back}d back → today+2")
         LOG.info("Elexon %s: +%d rows (%dd back)", provider, rows_added_total, days_back)
         return rows_added_total
     except Exception as exc:
