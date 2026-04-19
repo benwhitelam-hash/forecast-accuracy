@@ -1,0 +1,102 @@
+name: refresh-data
+
+# Runs the AgilePredict + Octopus + Elexon collectors and commits the
+# updated SQLite back to the repo. This is the *only* way the forecast
+# history gets built, since AgilePredict does not serve past snapshots.
+#
+# Schedule: roughly 06:20 / 10:20 / 16:20 / 22:20 UK local, chosen to
+# catch each AgilePredict refresh (06:15 / 10:15 / 16:15 / 22:15 UK)
+# plus the ~16:00 UK Octopus Agile publish for tomorrow. GitHub Actions
+# cron is UTC, so each UK target time is listed twice — once for GMT
+# (winter) and once for BST (summer). This means 8 runs/day always fire;
+# that's fine, collectors are idempotent (INSERT OR IGNORE / REPLACE)
+# and the extra runs just give us tighter polling and better resilience
+# to a flaky upstream.
+#
+# Note: GitHub Actions frequently delays or skips cron jobs scheduled at
+# `:00` or `:30` under load, hence `:20` throughout.
+
+on:
+  schedule:
+    # 06:20 UK
+    - cron: "20 6 * * *"   # GMT
+    - cron: "20 5 * * *"   # BST
+    # 10:20 UK
+    - cron: "20 10 * * *"  # GMT
+    - cron: "20 9 * * *"   # BST
+    # 16:20 UK
+    - cron: "20 16 * * *"  # GMT
+    - cron: "20 15 * * *"  # BST
+    # 22:20 UK
+    - cron: "20 22 * * *"  # GMT
+    - cron: "20 21 * * *"  # BST
+  workflow_dispatch:
+    inputs:
+      days_back:
+        description: "How many days of Octopus/Elexon history to backfill"
+        required: false
+        default: "7"
+
+permissions:
+  contents: write  # required so the bot can push DB updates back
+
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false  # never interrupt a run mid-commit
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Use the default GITHUB_TOKEN; `contents: write` above grants push.
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements-collect.txt
+
+      - name: Install collector requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-collect.txt
+
+      - name: Run collectors
+        env:
+          DAYS_BACK: ${{ github.event.inputs.days_back || '7' }}
+        run: |
+          python -m forecast_accuracy.cli refresh \
+            --region G \
+            --days-back "$DAYS_BACK"
+
+      - name: Summarise DB
+        run: python -m forecast_accuracy.cli summary
+
+      - name: Commit updated DB
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/forecast_accuracy.sqlite
+          if git diff --cached --quiet; then
+            echo "No DB changes to commit"
+            exit 0
+          fi
+          git commit -m "data: refresh $(date -u +%Y-%m-%dT%H:%MZ)"
+          # Belt-and-braces: rebase on top of anything that landed while we ran.
+          # Concurrency:cancel-in-progress=false should already prevent races,
+          # but this makes the push resilient to force-pushes or manual edits.
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt) — rebasing and retrying"
+            git pull --rebase origin "$(git rev-parse --abbrev-ref HEAD)"
+          done
+          echo "Push still failing after 3 retries" >&2
+          exit 1

@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# SQLite sidecars (DB itself IS tracked — that's the whole point)
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# OS / IDE noise
+.DS_Store
+.idea/
+.vscode/
+
+# Streamlit
+.streamlit/secrets.toml

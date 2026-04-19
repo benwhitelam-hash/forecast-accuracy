@@ -1,0 +1,2 @@
+# SQLite is a binary blob — no diff noise in PRs/commits
+*.sqlite binary

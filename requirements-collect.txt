@@ -1,0 +1,4 @@
+# Lean requirements for the cron-driven collector (GitHub Actions).
+# Kept separate from requirements.txt so CI doesn't install the Streamlit/pandas/altair
+# UI stack just to append ~200 rows to SQLite.
+requests>=2.31
