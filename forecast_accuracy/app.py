@@ -110,7 +110,9 @@ st.caption(
     "AgilePredict) are p/kWh × 10 with VAT and retail margin left in — they "
     "will sit systematically above wholesale (Elexon APX day-ahead, Elexon "
     "system price within-day). AgilePredict line uses the freshest snapshot "
-    "we hold per target half-hour. Dashed vertical line = now."
+    "we hold per target half-hour. X-axis is UK local time; background "
+    "shading goes grey overnight → yellowest at local noon. Dashed vertical "
+    "line = now."
 )
 
 with storage.connect() as conn:
@@ -143,6 +145,30 @@ slider_start, slider_end = st.slider(
     ),
 )
 
+# -- Per-series toggles --------------------------------------------------
+# Short checkbox labels; full labels stay in the chart/legend/tooltip.
+SERIES_SHORT = {
+    "Day-ahead (Elexon APX)":                       "Day-ahead",
+    "Within-day (Elexon system price)":             "Within-day",
+    "Confirmed (Octopus Agile)":                    "Octopus",
+    "Predicted (AgilePredict, freshest snapshot)":  "AgilePredict",
+}
+# Keep a single source of truth for per-series colour — the Altair scale
+# is then built from whichever subset is visible, so toggled-off series
+# disappear from the legend *and* colours stay stable across toggles.
+SERIES_COLOR = {
+    "Day-ahead (Elexon APX)":                       "#E1A800",
+    "Within-day (Elexon system price)":             "#6A3D9A",
+    "Confirmed (Octopus Agile)":                    "#1F77B4",
+    "Predicted (AgilePredict, freshest snapshot)":  "#D62728",
+}
+_toggle_cols = st.columns(len(analysis.RECENT_SERIES_LABELS))
+_visible_series = [
+    label for col, label in zip(_toggle_cols, analysis.RECENT_SERIES_LABELS)
+    if col.checkbox(SERIES_SHORT.get(label, label), value=True,
+                    key=f"series_toggle_{label}")
+]
+
 
 def _uk_date_to_utc_naive(d: _date, end_of_day: bool = False) -> pd.Timestamp:
     """UK-local midnight (or next-day midnight) → naive UTC Timestamp to
@@ -172,42 +198,122 @@ else:
     recent_all = recent_all.assign(target_start=ts)
     recent = recent_all[
         (recent_all["target_start"] >= _win_start_utc) &
-        (recent_all["target_start"] <  _win_end_utc)
+        (recent_all["target_start"] <  _win_end_utc) &
+        (recent_all["series"].isin(_visible_series))
     ].copy()
 
-if recent.empty:
+if not _visible_series:
+    st.info("All series are toggled off — tick one of the boxes above to draw a chart.")
+elif recent.empty:
     st.info(
-        "No half-hourly prices for the selected window. Widen the slider or "
-        "hit **Refresh data** with AgilePredict, Octopus Agile, Elexon APX "
-        "and Elexon within-day all ticked."
+        "No half-hourly prices for the selected window and series. Widen the "
+        "slider, tick more series, or hit **Refresh data** with AgilePredict, "
+        "Octopus Agile, Elexon APX and Elexon within-day all ticked."
     )
 else:
+    import math as _math
     now_utc_ts = pd.Timestamp.utcnow().tz_localize(None)
     window_span_days = (slider_end - slider_start).days + 1
     # Dots only read as dots when there's room for them — above ~5 days the
     # line-only rendering is much easier on the eye.
     show_points = window_span_days <= 5
 
-    # Friendly fixed colour order: day-ahead gold, within-day purple,
-    # confirmed blue, predicted red.
+    # Convert target_start (naive UTC) → naive UK-local for display. Vega
+    # treats all timestamps as UTC on the wire, so the trick is to plot the
+    # *UK local* wall-clock time and call it UTC — day boundaries then land
+    # on UK midnight, matching the slider and the user's mental model.
+    recent = recent.assign(
+        target_start_uk=(recent["target_start"]
+                         .dt.tz_localize("UTC")
+                         .dt.tz_convert(_UK)
+                         .dt.tz_localize(None))
+    )
+    # pandas < 2.2 returns naive UTC; ≥ 2.2 returns tz-aware. Normalise.
+    _now = pd.Timestamp.utcnow()
+    if _now.tzinfo is None:
+        _now = _now.tz_localize("UTC")
+    now_uk_ts = _now.tz_convert(_UK).tz_localize(None)
+    _win_start_uk = pd.Timestamp(_dt.combine(slider_start, _time(0, 0)))
+    _win_end_uk = pd.Timestamp(_dt.combine(slider_end + _td(days=1), _time(0, 0)))
+
+    # Daylight background: half-hourly buckets, "warmth" cosines from 0 at
+    # 06:00/18:00 up to 1 at local noon; clamped to 0 overnight. Colour
+    # interpolates grey→pale yellow→saturated yellow; kept desaturated so
+    # the actual price lines still dominate.
+    _bg_grid = pd.date_range(_win_start_uk, _win_end_uk, freq="30min",
+                             inclusive="left")
+    if len(_bg_grid):
+        _h = _bg_grid.hour + _bg_grid.minute / 60.0
+        _warmth = [max(0.0, _math.cos((x - 12.0) * _math.pi / 12.0)) for x in _h]
+        bg_df = pd.DataFrame({
+            "start": _bg_grid,
+            "end": _bg_grid + pd.Timedelta("30min"),
+            "warmth": _warmth,
+        })
+        background = (
+            alt.Chart(bg_df)
+            .mark_rect(opacity=0.55)
+            .encode(
+                x=alt.X("start:T"),
+                x2="end:T",
+                color=alt.Color(
+                    "warmth:Q",
+                    scale=alt.Scale(
+                        domain=[0.0, 0.15, 1.0],
+                        range=["#E8E8E8", "#FFF4CC", "#FFD24D"],
+                    ),
+                    legend=None,
+                ),
+            )
+        )
+    else:
+        background = None
+
+    # Colour scale is restricted to visible series so the legend only shows
+    # what is actually drawn — but each colour is still taken from the
+    # master map, so toggling a series off and on doesn't shuffle colours.
     color_scale = alt.Scale(
-        domain=analysis.RECENT_SERIES_LABELS,
-        range=["#E1A800", "#6A3D9A", "#1F77B4", "#D62728"],
+        domain=_visible_series,
+        range=[SERIES_COLOR[l] for l in _visible_series],
     )
     _mark_kwargs = {"strokeWidth": 1.8}
     if show_points:
         _mark_kwargs["point"] = alt.OverlayMarkDef(size=18, filled=True)
+
+    # Tiered x-axis: HH:MM on the top row, and the date on a second line,
+    # rendered only at the 12:00 tick so the day label sits centred under
+    # the day's data (rather than on the midnight boundary). We supply the
+    # tick positions explicitly — every 6 hours across the visible window
+    # — because Streamlit's bundled Vega doesn't accept the TickCountObject
+    # {interval, step} form cleanly, and explicit `values` also guarantees
+    # that 12:00 is always a tick (needed for the date label to render).
+    _tick_positions = pd.date_range(
+        _win_start_uk, _win_end_uk, freq="6h", inclusive="left"
+    )
+    _tiered_label_expr = (
+        "[timeFormat(datum.value, '%H:%M'), "
+        "timeFormat(datum.value, '%H:%M') == '12:00' "
+        "? timeFormat(datum.value, '%a %d %b') : '']"
+    )
+    x_axis = alt.Axis(
+        title=None,
+        labelExpr=_tiered_label_expr,
+        values=list(_tick_positions),
+        labelFontSize=11,
+        labelPadding=2,
+    )
     base = (
         alt.Chart(recent)
         .mark_line(**_mark_kwargs)
         .encode(
-            x=alt.X("target_start:T", title="Half-hour (UTC)"),
+            x=alt.X("target_start_uk:T", axis=x_axis),
             y=alt.Y("value_gbp_per_mwh:Q", title="£/MWh"),
             color=alt.Color("series:N", title="Series",
                             scale=color_scale,
-                            sort=analysis.RECENT_SERIES_LABELS),
+                            sort=_visible_series),
             tooltip=[
-                alt.Tooltip("target_start:T", title="HH (UTC)"),
+                alt.Tooltip("target_start_uk:T", title="HH (UK)",
+                            format="%a %d %b %H:%M"),
                 alt.Tooltip("series:N", title="Series"),
                 alt.Tooltip("value_gbp_per_mwh:Q", title="£/MWh", format=".2f"),
             ],
@@ -216,16 +322,21 @@ else:
     # Only draw the "now" rule when now is actually inside the selected
     # window — otherwise Altair would stretch the X axis to include it and
     # compress the data into a corner.
-    layers = [base]
-    if _win_start_utc <= now_utc_ts < _win_end_utc:
-        now_df = pd.DataFrame({"now": [now_utc_ts]})
+    layers = []
+    if background is not None:
+        layers.append(background)
+    layers.append(base)
+    if _win_start_uk <= now_uk_ts < _win_end_uk:
+        now_df = pd.DataFrame({"now": [now_uk_ts]})
         layers.append(
-            alt.Chart(now_df).mark_rule(strokeDash=[4, 4], color="#888").encode(x="now:T")
+            alt.Chart(now_df).mark_rule(strokeDash=[4, 4], color="#444").encode(x="now:T")
         )
     chart = layers[0] if len(layers) == 1 else alt.layer(*layers)
     st.altair_chart(chart.interactive(bind_y=False), width="stretch")
+    # Only call out series the user *wanted* to see but we have no rows for
+    # — toggled-off series are deliberately hidden, not missing.
     present = set(recent["series"].unique())
-    missing = [s for s in analysis.RECENT_SERIES_LABELS if s not in present]
+    missing = [s for s in _visible_series if s not in present]
     if missing:
         st.caption("Missing series (no rows in DB for this window): "
                    + ", ".join(missing))
