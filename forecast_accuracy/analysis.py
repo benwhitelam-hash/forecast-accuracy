@@ -225,6 +225,33 @@ def recent_prices(conn: sqlite3.Connection,
     return out
 
 
+def recent_consumption(conn: sqlite3.Connection,
+                       now: datetime | None = None,
+                       days_back: int = 1,
+                       days_forward: int = 2) -> pd.DataFrame:
+    """Return the user's own HH consumption (kWh) over a UK-aligned day window.
+
+    Aggregates across MPAN+serial (future-proofing for a meter swap): if
+    multiple rows share a target_start we sum them, on the assumption that
+    a single property never has two *concurrent* active meters. Typical
+    Octopus backfills are single-meter, so this is a no-op in practice.
+
+    Columns: target_start (UTC datetime), kwh (float).
+    """
+    start_iso, end_iso, _today = day_window(days_back=days_back,
+                                            days_forward=days_forward,
+                                            now=now)
+    df = pd.read_sql_query(
+        "SELECT target_start, SUM(kwh) AS kwh FROM consumption "
+        "WHERE target_start >= ? AND target_start < ? "
+        "GROUP BY target_start",
+        conn, params=(start_iso, end_iso), parse_dates=["target_start"],
+    )
+    if not df.empty:
+        df = df.sort_values("target_start").reset_index(drop=True)
+    return df
+
+
 def overall_accuracy(df: pd.DataFrame,
                      snapshot: Literal["latest", "all"] = "latest") -> pd.DataFrame:
     """Same as monthly_accuracy but aggregated across all months — one row per horizon."""

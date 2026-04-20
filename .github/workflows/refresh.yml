@@ -70,6 +70,13 @@ jobs:
       - name: Run collectors
         env:
           DAYS_BACK: ${{ github.event.inputs.days_back || '7' }}
+          # Consumption collector — auto-skips cleanly if these are unset.
+          # OCTOPUS_API_KEY must be a *secret*; MPAN + SERIAL are *variables*
+          # (they're identifiers, not credentials, but still low-signal so
+          # kept out of the repo).
+          OCTOPUS_API_KEY: ${{ secrets.OCTOPUS_API_KEY }}
+          OCTOPUS_MPAN: ${{ vars.OCTOPUS_MPAN }}
+          OCTOPUS_SERIAL: ${{ vars.OCTOPUS_SERIAL }}
         run: |
           python -m forecast_accuracy.cli refresh \
             --region G \

@@ -20,3 +20,7 @@ venv/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local secrets — Octopus API key etc. never goes in the repo.
+.env
+.env.*

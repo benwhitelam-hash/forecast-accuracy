@@ -12,7 +12,7 @@ import logging
 import sys
 
 from . import storage
-from .collectors import agilepredict, elexon, octopus
+from .collectors import agilepredict, consumption, elexon, octopus
 
 LOG = logging.getLogger("forecast_accuracy")
 
@@ -49,6 +49,12 @@ def cmd_refresh(args: argparse.Namespace) -> int:
             results.append(_safe("elexon_system_price",
                                  lambda: elexon.collect_system_price(
                                      conn, days_back=min(args.days_back, 14))))
+        if args.consumption:
+            # Consumption has its own (longer) days-back default so we backfill
+            # 90 days even when --days-back is small for the price collectors.
+            results.append(_safe("consumption",
+                                 lambda: consumption.collect(
+                                     conn, days_back=args.consumption_days_back)))
 
     failures = [r for r in results if r[2] is not None]
     for name, rows, err in results:
@@ -66,8 +72,9 @@ def cmd_refresh(args: argparse.Namespace) -> int:
 def cmd_summary(_args: argparse.Namespace) -> int:
     with storage.connect() as conn:
         s = storage.summary(conn)
-    print(f"forecasts: {s['forecast_rows']:,}  span {s['forecast_span']}")
-    print(f"outturn:   {s['outturn_rows']:,}  span {s['outturn_span']}")
+    print(f"forecasts:   {s['forecast_rows']:,}  span {s['forecast_span']}")
+    print(f"outturn:     {s['outturn_rows']:,}  span {s['outturn_span']}")
+    print(f"consumption: {s['consumption_rows']:,}  span {s['consumption_span']}")
     return 0
 
 
@@ -84,8 +91,13 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--no-elexon",        dest="elexon",        action="store_false")
     pr.add_argument("--no-elexon-wd",     dest="elexon_wd",     action="store_false",
                     help="Skip Elexon system price (within-day) collector.")
+    pr.add_argument("--no-consumption",   dest="consumption",   action="store_false",
+                    help="Skip Octopus consumption collector "
+                         "(auto-skipped if OCTOPUS_* env vars are unset).")
+    pr.add_argument("--consumption-days-back", type=int, default=90,
+                    help="How many days of own consumption to pull per run.")
     pr.set_defaults(agilepredict=True, octopus=True, elexon=True, elexon_wd=True,
-                    func=cmd_refresh)
+                    consumption=True, func=cmd_refresh)
 
     ps = sub.add_parser("summary", help="Show DB row counts / extents")
     ps.set_defaults(func=cmd_summary)

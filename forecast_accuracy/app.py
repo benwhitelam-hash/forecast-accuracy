@@ -22,7 +22,7 @@ import pandas as pd
 import streamlit as st
 
 from forecast_accuracy import analysis, costs, storage
-from forecast_accuracy.collectors import agilepredict, elexon, octopus
+from forecast_accuracy.collectors import agilepredict, consumption, elexon, octopus
 
 st.set_page_config(page_title="AgilePredict Accuracy", layout="wide")
 
@@ -53,6 +53,11 @@ with st.sidebar:
     refresh_octopus = st.checkbox("Octopus Agile", value=True)
     refresh_elexon = st.checkbox("Elexon APX (day-ahead)", value=True)
     refresh_elexon_wd = st.checkbox("Elexon system price (within-day)", value=True)
+    refresh_consumption = st.checkbox(
+        "Octopus consumption (your kWh)", value=True,
+        help="Pulls HH meter readings via the Octopus REST API. "
+             "Needs OCTOPUS_API_KEY / OCTOPUS_MPAN / OCTOPUS_SERIAL in "
+             "the environment — without them, collector skips cleanly.")
     run_refresh = st.button("↻ Refresh data", type="primary")
 
 # -- Refresh action -----------------------------------------------------------
@@ -84,6 +89,17 @@ if run_refresh:
                 logs.append(f"Elexon system price: +{n} within-day rows")
             except Exception as exc:
                 logs.append(f"Elexon system price: FAILED — {exc}")
+        if refresh_consumption:
+            try:
+                # Own consumption lags Octopus publishing by ~1 day. Use the
+                # sidebar's `days_back` value so the user can widen backfill
+                # on demand, same as the price collectors above.
+                n = consumption.collect(conn, days_back=int(days_back))
+                logs.append(f"Octopus consumption: +{n} HH rows")
+            except consumption.MissingCredentials as exc:
+                logs.append(f"Octopus consumption: skipped — {exc}")
+            except Exception as exc:
+                logs.append(f"Octopus consumption: FAILED — {exc}")
     for line in logs:
         st.toast(line)
 
@@ -118,6 +134,14 @@ st.caption(
 with storage.connect() as conn:
     recent_all = analysis.recent_prices(
         conn, region=region,
+        days_back=RECENT_DAYS_BACK,
+        days_forward=RECENT_DAYS_FORWARD,
+    )
+    # Own consumption — used by the profitability view below to compute real
+    # £ earned per HH. Absent entirely if OCTOPUS_* env vars aren't set, in
+    # which case the profitability block falls back to the model-only view.
+    consumption_all = analysis.recent_consumption(
+        conn,
         days_back=RECENT_DAYS_BACK,
         days_forward=RECENT_DAYS_FORWARD,
     )
@@ -201,6 +225,17 @@ else:
         (recent_all["target_start"] <  _win_end_utc) &
         (recent_all["series"].isin(_visible_series))
     ].copy()
+
+# Normalise consumption's target_start the same way (naive UTC) — it arrives
+# from read_sql_query already parsed, but belt-and-braces so downstream merges
+# against margin_df's target_start don't silently drop rows on a dtype mismatch.
+if not consumption_all.empty:
+    _cts = consumption_all["target_start"]
+    if not pd.api.types.is_datetime64_any_dtype(_cts):
+        _cts = pd.to_datetime(_cts, utc=True, errors="coerce")
+    if getattr(_cts.dt, "tz", None) is not None:
+        _cts = _cts.dt.tz_convert("UTC").dt.tz_localize(None)
+    consumption_all = consumption_all.assign(target_start=_cts)
 
 if not _visible_series:
     st.info("All series are toggled off — tick one of the boxes above to draw a chart.")
@@ -462,6 +497,25 @@ else:
         margin_df["margin_p_per_kwh"] = (
             margin_df["agile_ex_vat_p"] - margin_df["total_cost_p_per_kwh"]
         )
+        # Left-join own consumption so the chart still renders for HHs where
+        # consumption hasn't been published yet (Octopus is ~1 day behind),
+        # while the £ metrics and overlay still use whatever we do have.
+        if not consumption_all.empty:
+            _cons_win = consumption_all[
+                (consumption_all["target_start"] >= _win_start_utc) &
+                (consumption_all["target_start"] <  _win_end_utc)
+            ][["target_start", "kwh"]].copy()
+            margin_df = margin_df.merge(_cons_win, on="target_start", how="left")
+        else:
+            margin_df["kwh"] = pd.NA
+        # £ Octopus margin and £ revenue per HH — NaN where kwh missing so the
+        # sum() skips them cleanly. margin_p / 100 → £ per kWh.
+        margin_df["octopus_margin_gbp"] = (
+            margin_df["margin_p_per_kwh"] * margin_df["kwh"] / 100.0
+        )
+        margin_df["octopus_revenue_gbp"] = (
+            margin_df["agile_ex_vat_p"] * margin_df["kwh"] / 100.0
+        )
 
         # Convert all timestamp columns to UK-local naive so Vega draws them
         # aligned with the top chart's X axis.
@@ -584,6 +638,46 @@ else:
             neg_df = margin_df.assign(
                 margin_neg=margin_df["margin_p_per_kwh"].clip(upper=0.0),
             )
+            # Own consumption overlay — translucent grey bars on a secondary
+            # y-axis so they sit behind the margin shading without competing
+            # for the primary axis. HHs without consumption data are simply
+            # dropped; a missing-coverage caption below flags what's absent.
+            have_consumption = margin_df["kwh"].notna().any()
+            if have_consumption:
+                cons_df = margin_df.dropna(subset=["kwh"]).copy()
+                cons_df["bar_start"] = (cons_df["target_start_uk"]
+                                        - pd.Timedelta(minutes=15))
+                cons_df["bar_end"] = (cons_df["target_start_uk"]
+                                      + pd.Timedelta(minutes=15))
+                kwh_bars = (
+                    alt.Chart(cons_df)
+                    .mark_bar(opacity=0.28, color="#555")
+                    .encode(
+                        x=alt.X("bar_start:T", axis=_stack_x_axis),
+                        x2="bar_end:T",
+                        y=alt.Y(
+                            "kwh:Q",
+                            title="kWh (your use)",
+                            axis=alt.Axis(orient="right",
+                                          titleColor="#555",
+                                          labelColor="#555"),
+                        ),
+                        tooltip=[
+                            alt.Tooltip("target_start_uk:T", title="HH (UK)",
+                                        format="%a %d %b %H:%M"),
+                            alt.Tooltip("kwh:Q", title="Your use (kWh)",
+                                        format=".3f"),
+                            alt.Tooltip("octopus_margin_gbp:Q",
+                                        title="Octopus margin (£)",
+                                        format=".3f"),
+                            alt.Tooltip("octopus_revenue_gbp:Q",
+                                        title="Octopus revenue (£, ex-VAT)",
+                                        format=".3f"),
+                        ],
+                    )
+                )
+            else:
+                kwh_bars = None
             margin_pos_area = (
                 alt.Chart(pos_df)
                 .mark_area(opacity=0.45, color="#2CA02C")
@@ -640,10 +734,20 @@ else:
                     .mark_rule(strokeDash=[4, 4], color="#444")
                     .encode(x="now:T")
                 )
-            margin_chart = (
-                alt.layer(*margin_layers)
-                .properties(height=200)
-            )
+            # If we have consumption, put the kWh bars on a secondary y-axis
+            # layered *behind* the margin shading. resolve_scale y="independent"
+            # gives the bars their own scale; x stays shared.
+            if kwh_bars is not None:
+                margin_chart = (
+                    alt.layer(kwh_bars, *margin_layers)
+                    .resolve_scale(y="independent")
+                    .properties(height=220)
+                )
+            else:
+                margin_chart = (
+                    alt.layer(*margin_layers)
+                    .properties(height=200)
+                )
             st.altair_chart(margin_chart.interactive(bind_y=False),
                             width="stretch")
 
@@ -653,22 +757,67 @@ else:
             loss_frac = (margin_df["margin_p_per_kwh"] < 0).mean() * 100.0
             worst = margin_df["margin_p_per_kwh"].min()
             best = margin_df["margin_p_per_kwh"].max()
-            mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-            mcol1.metric("Mean margin", f"{mean_margin:+.2f} p/kWh",
-                         help="Simple mean of per-HH margin across the "
-                              "visible window (not consumption-weighted).")
-            mcol2.metric("Loss-making HHs", f"{loss_frac:.0f}%",
-                         help="Share of half-hours where the Agile retail "
-                              "rate ex-VAT is below the modelled cost stack.")
-            mcol3.metric("Worst HH", f"{worst:+.2f} p/kWh",
-                         help="Largest per-HH loss in the window.")
-            mcol4.metric("Best HH", f"{best:+.2f} p/kWh",
-                         help="Largest per-HH margin in the window.")
+
+            # £ metrics come from the own-consumption overlay — NaN-safe sum
+            # so an unmatched HH (no consumption yet) just drops out.
+            have_cons_kwh = bool(margin_df["kwh"].notna().any())
+            if have_cons_kwh:
+                total_margin_gbp = float(margin_df["octopus_margin_gbp"].sum(skipna=True))
+                total_revenue_gbp = float(margin_df["octopus_revenue_gbp"].sum(skipna=True))
+                matched = margin_df.dropna(subset=["kwh"])
+                # Days covered by HHs with consumption — not slider span —
+                # so the run-rate honours late-arriving Octopus data.
+                _cons_days = (matched["target_start"].max()
+                              - matched["target_start"].min()).total_seconds() / 86400.0
+                _cons_days = max(_cons_days, 1 / 48)  # guard divide-by-zero
+                daily_margin_gbp = total_margin_gbp / _cons_days
+            else:
+                total_margin_gbp = None
+                total_revenue_gbp = None
+                daily_margin_gbp = None
+
+            mcols = st.columns(6 if have_cons_kwh else 4)
+            mcols[0].metric("Mean margin", f"{mean_margin:+.2f} p/kWh",
+                            help="Simple mean of per-HH margin across the "
+                                 "visible window (not consumption-weighted).")
+            mcols[1].metric("Loss-making HHs", f"{loss_frac:.0f}%",
+                            help="Share of half-hours where the Agile retail "
+                                 "rate ex-VAT is below the modelled cost stack.")
+            mcols[2].metric("Worst HH", f"{worst:+.2f} p/kWh",
+                            help="Largest per-HH loss in the window.")
+            mcols[3].metric("Best HH", f"{best:+.2f} p/kWh",
+                            help="Largest per-HH margin in the window.")
+            if have_cons_kwh:
+                mcols[4].metric(
+                    "£ to Octopus (window)",
+                    f"£{total_margin_gbp:+.2f}",
+                    help=(
+                        "Modelled Octopus **margin** from your account across "
+                        "the visible window: sum of (margin p/kWh × your kWh) "
+                        "for HHs where we have consumption. Revenue (ex-VAT): "
+                        f"£{total_revenue_gbp:.2f}."
+                    ),
+                )
+                mcols[5].metric(
+                    "£/day run-rate",
+                    f"£{daily_margin_gbp:+.2f}",
+                    help="Total £ margin above, normalised to a per-day rate "
+                         "using the HH span that has consumption data (not the "
+                         "full slider window — Octopus consumption typically "
+                         "lands ~1 day late).",
+                )
             st.caption(
                 f"Green band = HHs where Agile > cost stack (Octopus wins). "
                 f"Red band = HHs where Agile < cost stack (Octopus loses). "
                 f"Brown dashed = target margin ({_stack_cfg.target_margin_p_per_kwh:.1f} "
-                f"p/kWh, Ofgem EBIT + headroom). Window covers {n_hh} HHs."
+                f"p/kWh, Ofgem EBIT + headroom). "
+                + (
+                    f"Grey bars (right axis) = your own HH consumption (kWh). "
+                    f"Window covers {n_hh} HHs, "
+                    f"{int(margin_df['kwh'].notna().sum())} with consumption."
+                    if have_cons_kwh
+                    else f"Window covers {n_hh} HHs."
+                )
             )
 
 st.divider()

@@ -1,8 +1,9 @@
-"""SQLite storage for forecasts and outturn.
+"""SQLite storage for forecasts, outturn, and consumption.
 
 Schema:
-  forecasts — one row per (predicted_at, target_start, region, source)
-  outturn   — one row per (target_start, region, source)
+  forecasts   — one row per (predicted_at, target_start, region, source)
+  outturn     — one row per (target_start, region, source)
+  consumption — one row per (target_start, mpan, serial) — user's own kWh
   All timestamps stored as ISO-8601 UTC strings ending in 'Z'.
 """
 from __future__ import annotations
@@ -47,6 +48,17 @@ CREATE TABLE IF NOT EXISTS outturn (
 );
 
 CREATE INDEX IF NOT EXISTS idx_outturn_target ON outturn(target_start);
+
+CREATE TABLE IF NOT EXISTS consumption (
+    target_start    TEXT NOT NULL,   -- ISO-8601 UTC, HH period start
+    mpan            TEXT NOT NULL,   -- 13-digit meter point administration number
+    serial          TEXT NOT NULL,   -- meter serial (so meter swaps don't collide)
+    kwh             REAL NOT NULL,   -- consumption for that HH (kWh)
+    fetched_at      TEXT NOT NULL,   -- ISO-8601 UTC
+    PRIMARY KEY (target_start, mpan, serial)
+);
+
+CREATE INDEX IF NOT EXISTS idx_consumption_target ON consumption(target_start);
 
 CREATE TABLE IF NOT EXISTS collector_runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +112,21 @@ def insert_outturn(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:
     return cur.rowcount or 0
 
 
+def insert_consumption(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:
+    """Insert/refresh HH consumption rows; returns rowcount.
+
+    REPLACE rather than IGNORE so a re-published HH (Octopus sometimes
+    restates) lands with the latest value.
+    """
+    sql = """
+        INSERT OR REPLACE INTO consumption
+            (target_start, mpan, serial, kwh, fetched_at)
+        VALUES (:target_start, :mpan, :serial, :kwh, :fetched_at)
+    """
+    cur = conn.executemany(sql, rows)
+    return cur.rowcount or 0
+
+
 def record_run(conn: sqlite3.Connection, collector: str, started_at: str,
                ended_at: str, rows_added: int, status: str, message: str = "") -> None:
     conn.execute(
@@ -119,9 +146,12 @@ def summary(conn: sqlite3.Connection) -> dict:
 
     fc_min, fc_max = _extent("forecasts", "target_start")
     ot_min, ot_max = _extent("outturn", "target_start")
+    cs_min, cs_max = _extent("consumption", "target_start")
     return {
         "forecast_rows": _count("forecasts"),
         "outturn_rows": _count("outturn"),
+        "consumption_rows": _count("consumption"),
         "forecast_span": (fc_min, fc_max),
         "outturn_span": (ot_min, ot_max),
+        "consumption_span": (cs_min, cs_max),
     }
