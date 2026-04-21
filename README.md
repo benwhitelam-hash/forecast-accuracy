@@ -4,6 +4,13 @@ Measures how accurate [AgilePredict](https://agilepredict.com) is at predicting
 Octopus Agile half-hourly prices, aggregated to monthly MAPE / MAE by
 forecast horizon.
 
+## Live app
+
+Hosted on [Streamlit Community Cloud](https://share.streamlit.io). The app
+auto-redeploys on every push to `main`, so the 8×/day CI refresh commits
+drive the live app's data refresh with no manual step. See
+[Deploying](#deploying) below.
+
 ## Why these sources
 
 | Role | Source | Why |
@@ -115,3 +122,21 @@ shape (same `insert_forecasts` / `insert_outturn` DAO contract).
 - **ENTSO-E.** Registration is currently deferred — their API access
   requires manual approval (up to 3 business days). The Elexon APX row is
   the same underlying data, free and immediate.
+
+## Deploying
+
+Hosted on [Streamlit Community Cloud](https://share.streamlit.io). One-time setup:
+
+1. Repo must be **public** (Community Cloud's free tier deploys only public repos).
+2. Sign in to share.streamlit.io with GitHub and click **New app**.
+3. Pick `benwhitelam-hash/forecast-accuracy`, branch `main`, main file
+   `forecast_accuracy/app.py`. Python version 3.12 (matches CI).
+4. No secrets / env vars needed — the app is read-only on the SQLite DB
+   committed to the repo.
+
+**Updating** is zero-touch: every push to `main` triggers Cloud to rebuild
+the app. The 8×/day CI workflow (`.github/workflows/refresh.yml`) pushes
+fresh DB commits, so the live app's data stays current automatically.
+
+**Config** lives in `.streamlit/config.toml` (theme, telemetry off). Edit
+and push to apply.

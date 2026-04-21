@@ -1,0 +1,11 @@
+# Streamlit config. Streamlit Community Cloud picks this up automatically.
+# Kept minimal — Cloud ignores most [server] settings and manages them itself.
+
+[browser]
+# Don't phone home to Streamlit's telemetry endpoint.
+gatherUsageStats = false
+
+[theme]
+# Match GitHub's dark aesthetic. Optional — remove this block for default light theme.
+base = "dark"
+primaryColor = "#f77c00"
